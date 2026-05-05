@@ -52,6 +52,16 @@ public final class EggnetCommunitySupport {
     public record ActorSessionAuthorization(String xuid, String authorization, long expiresAtMs) {
     }
 
+    public record LiveServerSnapshot(
+            long version,
+            Map<String, LiveServerInfo> serversByNetherId,
+            Map<String, String> netherIdByServerId
+    ) {
+        public static LiveServerSnapshot empty() {
+            return new LiveServerSnapshot(0L, Map.of(), Map.of());
+        }
+    }
+
     public static String resolveDesktopXuid(ObjectMapper mapper) {
         String overrideXuid = normalizeXuid(firstNonBlank(
                 System.getProperty(DESKTOP_XUID_SYS_PROP, ""),
@@ -153,16 +163,24 @@ public final class EggnetCommunitySupport {
         return out;
     }
 
-    public static Map<String, LiveServerInfo> fetchLiveServersByNetherId(
+    public static LiveServerSnapshot fetchLiveServerSnapshot(
             ObjectMapper mapper,
             HttpClient httpClient,
-            String liveList3Url
+            String liveList3Url,
+            LiveServerSnapshot previousSnapshot
     ) throws IOException, InterruptedException {
-        Map<String, LiveServerInfo> byNether = new HashMap<>();
-        String requestUrl = liveList3Url + (liveList3Url.contains("?") ? "&" : "?") + "_rt=" + Long.toUnsignedString(System.currentTimeMillis());
+        LiveServerSnapshot previous = previousSnapshot != null ? previousSnapshot : LiveServerSnapshot.empty();
+        long sinceVersion = Math.max(0L, previous.version());
+        StringBuilder requestUrl = new StringBuilder(liveList3Url)
+                .append(liveList3Url.contains("?") ? "&" : "?")
+                .append("_rt=")
+                .append(Long.toUnsignedString(System.currentTimeMillis()));
+        if (sinceVersion > 0L) {
+            requestUrl.append("&sinceVersion=").append(sinceVersion);
+        }
 
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(requestUrl))
+                .uri(URI.create(requestUrl.toString()))
                 .timeout(REQUEST_TIMEOUT)
                 .header("Accept", "application/json")
                 .header("Cache-Control", "no-cache, no-store")
@@ -176,69 +194,140 @@ public final class EggnetCommunitySupport {
         }
 
         JsonNode root = mapper.readTree(response.body());
-        JsonNode servers = root.path("servers");
-        if (!servers.isArray()) {
-            return byNether;
+        if (root == null || !root.path("ok").asBoolean(false)) {
+            throw new IOException(firstNonBlank(
+                    root == null ? "" : root.path("error").asText(""),
+                    "list3_rejected"
+            ));
+        }
+        long version = Math.max(0L, root.path("version").asLong(0L));
+        String mode = root.path("mode").asText("full").trim().toLowerCase(Locale.ROOT);
+        boolean reset = root.path("reset").asBoolean(false);
+        if (!"delta".equals(mode) || reset) {
+            return parseFullLiveServerSnapshot(mapper, root, version);
         }
 
-        for (JsonNode serverNode : servers) {
-            String netherId = serverNode.path("nethernetId").asText("").trim();
-            if (!hasText(netherId)) {
-                continue;
-            }
+        long baseVersion = Math.max(0L, root.path("baseVersion").asLong(0L));
+        if (sinceVersion <= 0L || baseVersion != sinceVersion) {
+            throw new IOException("list3_delta_base_mismatch");
+        }
 
-            JsonNode noteNode = serverNode.get("note");
-            if (noteNode == null || noteNode.isNull()) {
-                continue;
-            }
+        Map<String, LiveServerInfo> byNether = new HashMap<>(previous.serversByNetherId());
+        Map<String, String> byServerId = new HashMap<>(previous.netherIdByServerId());
 
-            JsonNode noteObj = noteNode;
-            if (noteNode.isTextual()) {
-                try {
-                    noteObj = mapper.readTree(noteNode.asText());
-                } catch (Exception ignored) {
+        JsonNode removes = root.path("removes");
+        if (removes.isArray()) {
+            for (JsonNode removeNode : removes) {
+                String serverId = removeNode.asText("").trim();
+                if (!hasText(serverId)) {
                     continue;
                 }
+                String netherId = byServerId.remove(serverId);
+                if (hasText(netherId)) {
+                    byNether.remove(netherId);
+                }
             }
-
-            JsonNode handle = noteObj.path("world").path("handle");
-            if (handle.isMissingNode() || handle.path("closed").asBoolean(false)) {
-                continue;
-            }
-
-            String pmsgId = handle.path("pmsgId").asText("").trim();
-            if (!hasText(pmsgId)) {
-                continue;
-            }
-            String sessionScid = handle.path("sessionScid").asText(handle.path("scid").asText("")).trim();
-            String sessionTemplateName = handle.path("sessionTemplateName").asText("").trim();
-            String sessionName = handle.path("sessionName").asText("").trim();
-            List2ServerMeta meta = parseList2ServerMeta(serverNode, handle);
-
-            byNether.put(
-                    netherId,
-                    new LiveServerInfo(
-                            netherId,
-                            pmsgId,
-                            sessionScid,
-                            sessionTemplateName,
-                            sessionName,
-                            meta.ownerXuid,
-                            meta.ownerGamertag,
-                            meta.worldName,
-                            meta.hostName,
-                            meta.displayTitle,
-                            meta.gameType,
-                            meta.primaryLanguage,
-                            meta.memberCount,
-                            meta.maxMemberCount,
-                            meta.connectionType,
-                            meta.transportLayer
-                    )
-            );
         }
 
-        return byNether;
+        JsonNode upserts = root.path("upserts");
+        if (upserts.isArray()) {
+            for (JsonNode serverNode : upserts) {
+                ParsedLiveServer parsed = parseLiveServer(mapper, serverNode);
+                if (parsed == null) {
+                    continue;
+                }
+                String previousNetherId = byServerId.put(parsed.serverId, parsed.live.nethernetId());
+                if (hasText(previousNetherId) && !previousNetherId.equals(parsed.live.nethernetId())) {
+                    byNether.remove(previousNetherId);
+                }
+                byNether.put(parsed.live.nethernetId(), parsed.live);
+            }
+        }
+
+        return new LiveServerSnapshot(version > 0L ? version : sinceVersion, Map.copyOf(byNether), Map.copyOf(byServerId));
+    }
+
+    private static LiveServerSnapshot parseFullLiveServerSnapshot(
+            ObjectMapper mapper,
+            JsonNode root,
+            long version
+    ) throws IOException {
+        Map<String, LiveServerInfo> byNether = new HashMap<>();
+        Map<String, String> byServerId = new HashMap<>();
+        JsonNode servers = root.path("servers");
+        if (!servers.isArray()) {
+            return new LiveServerSnapshot(Math.max(0L, version), Map.of(), Map.of());
+        }
+        for (JsonNode serverNode : servers) {
+            ParsedLiveServer parsed = parseLiveServer(mapper, serverNode);
+            if (parsed == null) {
+                continue;
+            }
+            byNether.put(parsed.live.nethernetId(), parsed.live);
+            byServerId.put(parsed.serverId, parsed.live.nethernetId());
+        }
+        return new LiveServerSnapshot(Math.max(0L, version), Map.copyOf(byNether), Map.copyOf(byServerId));
+    }
+
+    private static ParsedLiveServer parseLiveServer(ObjectMapper mapper, JsonNode serverNode) throws IOException {
+        if (serverNode == null || serverNode.isMissingNode() || serverNode.isNull()) {
+            return null;
+        }
+        String serverId = serverNode.path("serverId").asText("").trim();
+        String netherId = serverNode.path("nethernetId").asText("").trim();
+        if (!hasText(serverId) || !hasText(netherId)) {
+            return null;
+        }
+
+        JsonNode noteNode = serverNode.get("note");
+        if (noteNode == null || noteNode.isNull()) {
+            return null;
+        }
+
+        JsonNode noteObj = noteNode;
+        if (noteNode.isTextual()) {
+            try {
+                noteObj = mapper.readTree(noteNode.asText());
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+
+        JsonNode handle = noteObj.path("world").path("handle");
+        if (handle.isMissingNode() || handle.path("closed").asBoolean(false)) {
+            return null;
+        }
+
+        String pmsgId = handle.path("pmsgId").asText("").trim();
+        if (!hasText(pmsgId)) {
+            return null;
+        }
+        String sessionScid = handle.path("sessionScid").asText(handle.path("scid").asText("")).trim();
+        String sessionTemplateName = handle.path("sessionTemplateName").asText("").trim();
+        String sessionName = handle.path("sessionName").asText("").trim();
+        List2ServerMeta meta = parseList2ServerMeta(serverNode, handle);
+
+        return new ParsedLiveServer(
+                serverId,
+                new LiveServerInfo(
+                        netherId,
+                        pmsgId,
+                        sessionScid,
+                        sessionTemplateName,
+                        sessionName,
+                        meta.ownerXuid,
+                        meta.ownerGamertag,
+                        meta.worldName,
+                        meta.hostName,
+                        meta.displayTitle,
+                        meta.gameType,
+                        meta.primaryLanguage,
+                        meta.memberCount,
+                        meta.maxMemberCount,
+                        meta.connectionType,
+                        meta.transportLayer
+                )
+        );
     }
 
     public static SessionAuthorization fetchSelfMinecraftSessionAuthorization(
@@ -549,5 +638,8 @@ public final class EggnetCommunitySupport {
             int connectionType,
             int transportLayer
     ) {
+    }
+
+    private record ParsedLiveServer(String serverId, LiveServerInfo live) {
     }
 }

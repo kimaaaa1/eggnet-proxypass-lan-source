@@ -213,6 +213,7 @@ public class ProxyPass {
     private final AtomicLong dynamicLocalIdCursor = new AtomicLong(DYNAMIC_LOCAL_ID_START);
     private final Map<String, Long> dynamicLocalIdByNetherId = new ConcurrentHashMap<>();
     private String liveList3Url = LIST3_URL_DEFAULT;
+    private EggnetCommunitySupport.LiveServerSnapshot liveServerSnapshot = EggnetCommunitySupport.LiveServerSnapshot.empty();
     private String communityFollowingUrl = COMMUNITY_FOLLOWING_URL_DEFAULT;
     private String communityFollowersUrl = COMMUNITY_FOLLOWERS_URL_DEFAULT;
     private String communityRandomActorUrl = COMMUNITY_RANDOM_ACTOR_URL_DEFAULT;
@@ -1101,12 +1102,15 @@ public class ProxyPass {
 
     private Map<String, LiveServerInfo> fetchLiveServersByNetherId() {
         try {
-            Map<String, EggnetCommunitySupport.LiveServerInfo> fetched =
-                    EggnetCommunitySupport.fetchLiveServersByNetherId(
+            EggnetCommunitySupport.LiveServerSnapshot snapshot =
+                    EggnetCommunitySupport.fetchLiveServerSnapshot(
                             ProxyPass.JSON_MAPPER,
                             this.list2HttpClient,
-                            this.liveList3Url
+                            this.liveList3Url,
+                            this.liveServerSnapshot
                     );
+            this.liveServerSnapshot = snapshot;
+            Map<String, EggnetCommunitySupport.LiveServerInfo> fetched = snapshot.serversByNetherId();
             Map<String, LiveServerInfo> byNether = new HashMap<>(fetched.size());
             for (EggnetCommunitySupport.LiveServerInfo live : fetched.values()) {
                 byNether.put(

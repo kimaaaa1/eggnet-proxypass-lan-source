@@ -97,6 +97,7 @@ public final class NetherNetConnectorCli {
         private volatile long currentSignalAuthExpiresAtMs = 0L;
         private volatile String lastRouteSignature = "";
         private volatile String lastLoginState = "";
+        private EggnetCommunitySupport.LiveServerSnapshot liveServerSnapshot = EggnetCommunitySupport.LiveServerSnapshot.empty();
 
         private ConnectorRuntime(Args args) {
             this.args = args;
@@ -349,11 +350,14 @@ public final class NetherNetConnectorCli {
 
             Map<String, EggnetCommunitySupport.LiveServerInfo> liveByNether = Map.of();
             if (EggnetCommunitySupport.hasText(selfXuid) || activePrimedCount > 0) {
-                liveByNether = EggnetCommunitySupport.fetchLiveServersByNetherId(
+                EggnetCommunitySupport.LiveServerSnapshot snapshot = EggnetCommunitySupport.fetchLiveServerSnapshot(
                         JSON,
                         HTTP,
-                        EggnetCommunitySupport.LIST3_URL_DEFAULT
+                        EggnetCommunitySupport.LIST3_URL_DEFAULT,
+                        liveServerSnapshot
                 );
+                liveServerSnapshot = snapshot;
+                liveByNether = snapshot.serversByNetherId();
             }
             if (activePrimedCount > 0) {
                 activePrimedCount = syncPrimedRoutesWithLive(liveByNether);
