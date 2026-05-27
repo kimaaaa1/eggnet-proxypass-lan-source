@@ -124,6 +124,7 @@ tasks.register<JavaCompile>("compileMctokenHelperJava") {
 tasks.register<Copy>("processConnectorResources") {
     from("src/main/resources") {
         include("log4j2.xml")
+        include("eggnet-tray-icon.png")
     }
     into(connectorResourcesDir)
 }
@@ -141,6 +142,7 @@ tasks.register<ShadowJar>("connectorShadowJar") {
     }
     from(connectorResourcesDir) {
         include("log4j2.xml")
+        include("eggnet-tray-icon.png")
     }
     manifest {
         attributes["Enable-Native-Access"] = "ALL-UNNAMED"

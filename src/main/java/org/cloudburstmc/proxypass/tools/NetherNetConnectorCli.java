@@ -1,5 +1,6 @@
 package org.cloudburstmc.proxypass.tools;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.kastle.netty.channel.nethernet.NetherNetChannelFactory;
 import dev.kastle.netty.channel.nethernet.NetherNetClientChannel;
@@ -26,14 +27,32 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.util.ReferenceCountUtil;
 import org.cloudburstmc.proxypass.EggnetCommunitySupport;
 
+import java.awt.AWTException;
+import java.awt.Color;
+import java.awt.Font;
+import java.awt.Graphics2D;
+import java.awt.MenuItem;
+import java.awt.PopupMenu;
+import java.awt.RenderingHints;
+import java.awt.SystemTray;
+import java.awt.TrayIcon;
+import java.awt.image.BufferedImage;
 import java.net.InetSocketAddress;
+import java.net.InetAddress;
+import java.net.InterfaceAddress;
+import java.net.NetworkInterface;
 import java.net.http.HttpClient;
 import java.io.BufferedReader;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Base64;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -52,6 +71,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import javax.imageio.ImageIO;
 
 public final class NetherNetConnectorCli {
     private static final String COMMAND_ACK_PREFIX = "__eggnet_cmd_ack__:";
@@ -59,13 +79,22 @@ public final class NetherNetConnectorCli {
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(EggnetCommunitySupport.CONNECT_TIMEOUT)
             .build();
-    private static final long DEFAULT_REFRESH_MS = 1_000L;
+    private static final long DEFAULT_REFRESH_MS = 5_000L;
     private static final long DEFAULT_AUTH_REFRESH_MS = 10 * 60 * 1_000L;
     private static final long AUTH_REFRESH_LEAD_MS = 120_000L;
     private static final long AUTH_MIN_ACTIVE_MS = 5_000L;
-    private static final int LISTEN_PORT = 7551;
+    private static final int LOCAL_DISCOVERY_PORT = 8282;
+    private static final int MINECRAFT_DISCOVERY_PORT = 7551;
+    private static final long LAN_ADVERTISEMENT_MS = 800L;
     private static final long ROUTE_MISS_GRACE_MS = 30_000L;
     private static final long DYNAMIC_LOCAL_ID_START = 4_000_000_000_000_000_000L;
+    private static final String TRAY_ICON_RESOURCE = "/eggnet-tray-icon.png";
+    private static final String LOCAL_GUEST_FOLLOWS_FILE = "local_guest_follows.json";
+    private static final String LOCAL_GUEST_FOLLOWS_FILE_SYS_PROP = "eggnet.localGuestFollowsFile";
+    private static final int LOCAL_GUEST_FOLLOW_LIMIT = 200;
+    private static final String DESKTOP_APP_EXE_ENV = "EGGNET_DESKTOP_APP_EXE";
+    private static final String OWN_WORLD_WAKE_ARG = "--eggnet-own-world-found";
+    private static final long OWN_WORLD_WAKE_COOLDOWN_MS = 10 * 60 * 1000L;
     private NetherNetConnectorCli() {
     }
 
@@ -89,6 +118,7 @@ public final class NetherNetConnectorCli {
         private final Map<String, Long> routeMissingSinceByNetherId = new HashMap<>();
         private final Map<String, TargetRoute> routesByLocalNetworkId = new HashMap<>();
         private final Map<String, PrimedRouteState> primedStatesByLocalNetworkId = new HashMap<>();
+        private final Object localGuestFollowsLock = new Object();
         private volatile Channel server;
         private volatile NetherNetDiscoverySignaling discoverySignaling;
         private volatile String currentDesktopXuid = "";
@@ -97,6 +127,10 @@ public final class NetherNetConnectorCli {
         private volatile long currentSignalAuthExpiresAtMs = 0L;
         private volatile String lastRouteSignature = "";
         private volatile String lastLoginState = "";
+        private volatile String lastObservedOwnWorldKey = "";
+        private volatile String lastOwnWorldWakeKey = "";
+        private volatile long lastOwnWorldWakeAtMs = 0L;
+        private volatile TrayIcon trayIcon;
         private EggnetCommunitySupport.LiveServerSnapshot liveServerSnapshot = EggnetCommunitySupport.LiveServerSnapshot.empty();
 
         private ConnectorRuntime(Args args) {
@@ -112,7 +146,16 @@ public final class NetherNetConnectorCli {
         void start() {
             Runtime.getRuntime().addShutdownHook(new Thread(this::close, "nethernet-connector-shutdown"));
             refreshExecutor.scheduleWithFixedDelay(this::refreshSafely, 0L, Math.max(500L, args.refreshMs), TimeUnit.MILLISECONDS);
-            if (args.desktopManaged) {
+            refreshExecutor.scheduleWithFixedDelay(
+                    this::broadcastAdvertisementsSafely,
+                    250L,
+                    LAN_ADVERTISEMENT_MS,
+                    TimeUnit.MILLISECONDS
+            );
+            if (args.desktopResident) {
+                installTrayIcon();
+            }
+            if (args.desktopManaged || args.desktopResident) {
                 startCommandLoop();
             }
         }
@@ -165,9 +208,83 @@ public final class NetherNetConnectorCli {
             }
         }
 
+        private void installTrayIcon() {
+            try {
+                if (!SystemTray.isSupported()) {
+                    warn("System tray is not supported; Eggnet LAN will keep running without tray icon");
+                    return;
+                }
+
+                PopupMenu menu = new PopupMenu();
+                MenuItem status = new MenuItem("Eggnet LAN running");
+                status.setEnabled(false);
+                MenuItem refresh = new MenuItem("Refresh LAN");
+                refresh.addActionListener(event -> triggerRefreshAsync());
+                MenuItem stop = new MenuItem("Stop Eggnet LAN");
+                stop.addActionListener(event -> close());
+                menu.add(status);
+                menu.addSeparator();
+                menu.add(refresh);
+                menu.addSeparator();
+                menu.add(stop);
+
+                TrayIcon icon = new TrayIcon(createTrayImage(), "Eggnet LAN", menu);
+                icon.setImageAutoSize(true);
+                icon.addActionListener(event -> triggerRefreshAsync());
+                SystemTray.getSystemTray().add(icon);
+                this.trayIcon = icon;
+                info("Eggnet LAN tray icon installed");
+            } catch (AWTException | RuntimeException | Error e) {
+                warn("Failed to install Eggnet LAN tray icon: %s", e.getMessage());
+            }
+        }
+
+        private static BufferedImage createTrayImage() {
+            try (InputStream input = NetherNetConnectorCli.class.getResourceAsStream(TRAY_ICON_RESOURCE)) {
+                if (input != null) {
+                    BufferedImage officialIcon = ImageIO.read(input);
+                    if (officialIcon != null) {
+                        return officialIcon;
+                    }
+                }
+            } catch (Exception e) {
+                warn("Failed to load Eggnet tray icon resource: %s", e.getMessage());
+            }
+
+            int size = 32;
+            BufferedImage image = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D g = image.createGraphics();
+            try {
+                g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g.setColor(new Color(0x102033));
+                g.fillRoundRect(1, 1, 30, 30, 8, 8);
+                g.setColor(new Color(0xFFD36A));
+                g.fillOval(8, 4, 16, 22);
+                g.setColor(new Color(0xFFF4E0));
+                g.fillOval(10, 6, 12, 18);
+                g.setColor(new Color(0x22C55E));
+                g.fillRoundRect(22, 17, 3, 8, 2, 2);
+                g.fillRoundRect(26, 13, 3, 12, 2, 2);
+                g.setColor(Color.WHITE);
+                g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 8));
+                g.drawString("LAN", 6, 30);
+            } finally {
+                g.dispose();
+            }
+            return image;
+        }
+
         void close() {
             if (!closed.compareAndSet(false, true)) {
                 return;
+            }
+            TrayIcon icon = this.trayIcon;
+            this.trayIcon = null;
+            if (icon != null) {
+                try {
+                    SystemTray.getSystemTray().remove(icon);
+                } catch (Exception ignored) {
+                }
             }
             clearRoutes();
             closeServer();
@@ -272,6 +389,7 @@ public final class NetherNetConnectorCli {
             TargetRoute route = TargetRoute.fromMap(routeMap);
             long authExpiresAtMs = longValue(payload.get("authExpiresAtMs"), 0L);
             try {
+                rememberLocalGuestFollow(route);
                 ensureServerRunning();
                 upsertPrimedRoute(route, new PrimedRouteState(
                         actorXuid,
@@ -283,6 +401,40 @@ public final class NetherNetConnectorCli {
                 warn("random actor join prime failed: %s", e.getMessage());
                 return false;
             }
+        }
+
+        private void rememberLocalGuestFollow(TargetRoute route) {
+            if (route == null) {
+                return;
+            }
+            String ownerXuid = EggnetCommunitySupport.normalizeXuid(route.ownerXuid());
+            String nethernetId = route.nethernetId();
+            if (!EggnetCommunitySupport.hasText(ownerXuid) && !EggnetCommunitySupport.hasText(nethernetId)) {
+                return;
+            }
+            synchronized (localGuestFollowsLock) {
+                LocalGuestFollows existing = readLocalGuestFollowsLocked();
+                Set<String> ownerXuids = limitedSet(ownerXuid, existing.ownerXuids());
+                Set<String> nethernetIds = limitedSet(nethernetId, existing.nethernetIds());
+                writeLocalGuestFollowsLocked(ownerXuids, nethernetIds);
+            }
+        }
+
+        private Set<String> limitedSet(String first, Set<String> rest) {
+            Set<String> out = new LinkedHashSet<>();
+            if (EggnetCommunitySupport.hasText(first)) {
+                out.add(first.trim());
+            }
+            for (String value : rest) {
+                if (!EggnetCommunitySupport.hasText(value)) {
+                    continue;
+                }
+                out.add(value.trim());
+                if (out.size() >= LOCAL_GUEST_FOLLOW_LIMIT) {
+                    break;
+                }
+            }
+            return out;
         }
 
         private void upsertPrimedRoute(TargetRoute route, PrimedRouteState primedState) {
@@ -329,14 +481,64 @@ public final class NetherNetConnectorCli {
             }
         }
 
+        private void broadcastAdvertisementsSafely() {
+            if (closed.get()) {
+                return;
+            }
+            NetherNetDiscoverySignaling signaling = this.discoverySignaling;
+            if (signaling == null) {
+                return;
+            }
+            try {
+                signaling.sendDiscoveryResponsesTo(minecraftDiscoveryTargets());
+            } catch (Throwable t) {
+                warn("LAN advertisement broadcast failed: %s", t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
+            }
+        }
+
+        private List<InetSocketAddress> minecraftDiscoveryTargets() {
+            Map<String, InetSocketAddress> targets = new LinkedHashMap<>();
+            try {
+                addMinecraftDiscoveryTarget(targets, InetAddress.getByName("255.255.255.255"));
+            } catch (Exception ignored) {
+            }
+
+            try {
+                var interfaces = NetworkInterface.getNetworkInterfaces();
+                if (interfaces != null) {
+                    for (NetworkInterface networkInterface : Collections.list(interfaces)) {
+                        if (!networkInterface.isUp() || networkInterface.isLoopback()) {
+                            continue;
+                        }
+                        for (InterfaceAddress address : networkInterface.getInterfaceAddresses()) {
+                            InetAddress broadcast = address.getBroadcast();
+                            if (broadcast != null) {
+                                addMinecraftDiscoveryTarget(targets, broadcast);
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            return new ArrayList<>(targets.values());
+        }
+
+        private void addMinecraftDiscoveryTarget(Map<String, InetSocketAddress> targets, InetAddress address) {
+            String key = address.getHostAddress() + ":" + MINECRAFT_DISCOVERY_PORT;
+            targets.putIfAbsent(key, new InetSocketAddress(address, MINECRAFT_DISCOVERY_PORT));
+        }
+
         private void refreshOnce() throws Exception {
             long now = System.currentTimeMillis();
             int activePrimedCount = pruneExpiredPrimedStates(now);
             String selfXuid = resolveSelfXuid();
+            LocalGuestFollows localGuestFollows = EggnetCommunitySupport.hasText(selfXuid)
+                    ? LocalGuestFollows.empty()
+                    : readLocalGuestFollows();
             if (EggnetCommunitySupport.hasText(selfXuid)) {
                 activePrimedCount = clearPrimedStatesForLoggedInUser();
             }
-            if (!EggnetCommunitySupport.hasText(selfXuid) && activePrimedCount == 0) {
+            if (!EggnetCommunitySupport.hasText(selfXuid) && activePrimedCount == 0 && localGuestFollows.isEmpty()) {
                 if (!"logged_out".equals(lastLoginState)) {
                     info("No desktop XUID found. Connector idle.");
                     lastLoginState = "logged_out";
@@ -349,7 +551,7 @@ public final class NetherNetConnectorCli {
             }
 
             Map<String, EggnetCommunitySupport.LiveServerInfo> liveByNether = Map.of();
-            if (EggnetCommunitySupport.hasText(selfXuid) || activePrimedCount > 0) {
+            if (EggnetCommunitySupport.hasText(selfXuid) || activePrimedCount > 0 || !localGuestFollows.isEmpty()) {
                 EggnetCommunitySupport.LiveServerSnapshot snapshot = EggnetCommunitySupport.fetchLiveServerSnapshot(
                         JSON,
                         HTTP,
@@ -362,7 +564,10 @@ public final class NetherNetConnectorCli {
             if (activePrimedCount > 0) {
                 activePrimedCount = syncPrimedRoutesWithLive(liveByNether);
             }
-            if (!EggnetCommunitySupport.hasText(selfXuid) && activePrimedCount == 0) {
+            if (EggnetCommunitySupport.hasText(selfXuid)) {
+                maybeWakeEggnetForOwnWorld(selfXuid, liveByNether);
+            }
+            if (!EggnetCommunitySupport.hasText(selfXuid) && activePrimedCount == 0 && localGuestFollows.isEmpty()) {
                 if (!"logged_out".equals(lastLoginState)) {
                     info("No desktop XUID found. Connector idle.");
                     lastLoginState = "logged_out";
@@ -400,10 +605,121 @@ public final class NetherNetConnectorCli {
                     }
                     routes.add(TargetRoute.fromLive(live));
                 }
+            } else if (!localGuestFollows.isEmpty()) {
+                for (EggnetCommunitySupport.LiveServerInfo live : liveByNether.values()) {
+                    if (!localGuestFollows.matches(live.ownerXuid(), live.nethernetId())) {
+                        continue;
+                    }
+                    routes.add(TargetRoute.fromLive(live));
+                }
             }
             sortRoutesForLanTab(routes, resolvePreferredLanguage(), captureStableRouteOrder());
 
             applyRoutes(routes);
+        }
+
+        private LocalGuestFollows readLocalGuestFollows() {
+            synchronized (localGuestFollowsLock) {
+                return readLocalGuestFollowsLocked();
+            }
+        }
+
+        private LocalGuestFollows readLocalGuestFollowsLocked() {
+            Path path = localGuestFollowsPath();
+            if (path == null || !Files.isRegularFile(path)) {
+                return LocalGuestFollows.empty();
+            }
+            try {
+                JsonNode root = JSON.readTree(path.toFile());
+                Set<String> ownerXuids = new LinkedHashSet<>();
+                Set<String> nethernetIds = new LinkedHashSet<>();
+                readLocalGuestFollowNode(root.path("ownerXuids"), ownerXuids, true);
+                readLocalGuestFollowNode(root.path("nethernetIds"), nethernetIds, false);
+                if (root.isArray()) {
+                    for (JsonNode item : root) {
+                        addLocalGuestFollowOwner(ownerXuids, item.path("ownerXuid").asText(""));
+                        addLocalGuestFollowNether(nethernetIds, item.path("nethernetId").asText(""));
+                    }
+                } else {
+                    JsonNode items = root.path("items");
+                    if (items.isArray()) {
+                        for (JsonNode item : items) {
+                            addLocalGuestFollowOwner(ownerXuids, item.path("ownerXuid").asText(""));
+                            addLocalGuestFollowNether(nethernetIds, item.path("nethernetId").asText(""));
+                        }
+                    }
+                }
+                return new LocalGuestFollows(ownerXuids, nethernetIds);
+            } catch (Exception e) {
+                warn("Failed to read local guest follows: %s", e.getMessage());
+                return LocalGuestFollows.empty();
+            }
+        }
+
+        private void readLocalGuestFollowNode(JsonNode node, Set<String> out, boolean ownerXuid) {
+            if (!node.isArray()) {
+                return;
+            }
+            for (JsonNode item : node) {
+                if (ownerXuid) {
+                    addLocalGuestFollowOwner(out, item.asText(""));
+                } else {
+                    addLocalGuestFollowNether(out, item.asText(""));
+                }
+            }
+        }
+
+        private void addLocalGuestFollowOwner(Set<String> out, String raw) {
+            String xuid = EggnetCommunitySupport.normalizeXuid(raw);
+            if (EggnetCommunitySupport.hasText(xuid)) {
+                out.add(xuid);
+            }
+        }
+
+        private void addLocalGuestFollowNether(Set<String> out, String raw) {
+            String nethernetId = raw == null ? "" : raw.trim();
+            if (EggnetCommunitySupport.hasText(nethernetId)) {
+                out.add(nethernetId);
+            }
+        }
+
+        private void writeLocalGuestFollowsLocked(Set<String> ownerXuids, Set<String> nethernetIds) {
+            Path path = localGuestFollowsPath();
+            if (path == null) {
+                return;
+            }
+            try {
+                Path parent = path.getParent();
+                if (parent != null) {
+                    Files.createDirectories(parent);
+                }
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("ownerXuids", new ArrayList<>(ownerXuids));
+                payload.put("nethernetIds", new ArrayList<>(nethernetIds));
+                payload.put("updatedAtMs", System.currentTimeMillis());
+                JSON.writerWithDefaultPrettyPrinter().writeValue(path.toFile(), payload);
+            } catch (Exception e) {
+                warn("Failed to write local guest follows: %s", e.getMessage());
+            }
+        }
+
+        private Path localGuestFollowsPath() {
+            String override = System.getProperty(LOCAL_GUEST_FOLLOWS_FILE_SYS_PROP, "").trim();
+            if (EggnetCommunitySupport.hasText(override)) {
+                try {
+                    return Paths.get(override);
+                } catch (Exception ignored) {
+                }
+            }
+            String appData = System.getenv("APPDATA");
+            if (EggnetCommunitySupport.hasText(appData)) {
+                return Paths.get(appData, "Eggnet Arcade", LOCAL_GUEST_FOLLOWS_FILE);
+            }
+            String home = System.getenv("HOME");
+            if (EggnetCommunitySupport.hasText(home)) {
+                return Paths.get(home, ".config", "Eggnet Arcade", LOCAL_GUEST_FOLLOWS_FILE);
+            }
+            return Paths.get(".").toAbsolutePath().normalize().resolve(LOCAL_GUEST_FOLLOWS_FILE);
         }
 
         private String resolvePreferredLanguage() {
@@ -496,6 +812,149 @@ public final class NetherNetConnectorCli {
             return xuid;
         }
 
+        private void maybeWakeEggnetForOwnWorld(
+                String selfXuid,
+                Map<String, EggnetCommunitySupport.LiveServerInfo> liveByNether
+        ) {
+            String normalizedSelf = EggnetCommunitySupport.normalizeXuid(selfXuid);
+            if (!EggnetCommunitySupport.hasText(normalizedSelf) || liveByNether == null || liveByNether.isEmpty()) {
+                lastObservedOwnWorldKey = "";
+                return;
+            }
+            for (EggnetCommunitySupport.LiveServerInfo live : liveByNether.values()) {
+                if (!normalizedSelf.equals(EggnetCommunitySupport.normalizeXuid(live.ownerXuid()))) {
+                    continue;
+                }
+                String key = EggnetCommunitySupport.firstNonBlank(
+                        live.nethernetId(),
+                        live.pmsgId(),
+                        live.sessionName(),
+                        live.displayTitle()
+                );
+                if (!EggnetCommunitySupport.hasText(key)) {
+                    key = normalizedSelf;
+                }
+                if (key.equals(lastObservedOwnWorldKey)) {
+                    return;
+                }
+                lastObservedOwnWorldKey = key;
+                long now = System.currentTimeMillis();
+                if (key.equals(lastOwnWorldWakeKey) && now - lastOwnWorldWakeAtMs < OWN_WORLD_WAKE_COOLDOWN_MS) {
+                    return;
+                }
+                if (wakeEggnetDesktopForOwnWorld(live)) {
+                    lastOwnWorldWakeKey = key;
+                    lastOwnWorldWakeAtMs = now;
+                }
+                return;
+            }
+            lastObservedOwnWorldKey = "";
+        }
+
+        private boolean wakeEggnetDesktopForOwnWorld(EggnetCommunitySupport.LiveServerInfo live) {
+            Path desktopExe = resolveEggnetDesktopExe();
+            if (desktopExe == null) {
+                warn("own-world wake skipped: Eggnet desktop exe not found");
+                return false;
+            }
+            if (isEggnetDesktopAppRunning(desktopExe)) {
+                info("own-world wake skipped: Eggnet desktop app already running");
+                return false;
+            }
+            try {
+                ProcessBuilder builder = new ProcessBuilder(desktopExe.toString(), OWN_WORLD_WAKE_ARG);
+                Path parent = desktopExe.getParent();
+                if (parent != null) {
+                    builder.directory(parent.toFile());
+                }
+                builder.start();
+                info("own-world wake launched Eggnet app world=%s host=%s",
+                        live.displayTitle(),
+                        live.hostName());
+                return true;
+            } catch (Exception e) {
+                warn("own-world wake launch failed: %s", e.getMessage());
+                return false;
+            }
+        }
+
+        private Path resolveEggnetDesktopExe() {
+            String explicit = Objects.requireNonNullElse(System.getenv(DESKTOP_APP_EXE_ENV), "").trim();
+            if (EggnetCommunitySupport.hasText(explicit)) {
+                Path path = safePath(explicit);
+                if (path != null && Files.isRegularFile(path)) {
+                    return path.toAbsolutePath().normalize();
+                }
+            }
+
+            Path connectorPath = currentProcessPath();
+            Path connectorDir = connectorPath == null ? null : connectorPath.getParent();
+            if (connectorDir == null) {
+                return null;
+            }
+            String[] candidates = new String[]{
+                    "eggnet_fresh_web_ui.exe",
+                    "Eggnet Arcade.exe"
+            };
+            for (String candidate : candidates) {
+                Path path = connectorDir.resolve(candidate).toAbsolutePath().normalize();
+                if (Files.isRegularFile(path)) {
+                    return path;
+                }
+            }
+            return null;
+        }
+
+        private Path currentProcessPath() {
+            String command = ProcessHandle.current().info().command().orElse("").trim();
+            Path commandPath = safePath(command);
+            if (commandPath != null && Files.isRegularFile(commandPath)) {
+                return commandPath.toAbsolutePath().normalize();
+            }
+            return null;
+        }
+
+        private boolean isEggnetDesktopAppRunning(Path desktopExe) {
+            String expected = normalizePathString(desktopExe);
+            if (!EggnetCommunitySupport.hasText(expected)) {
+                return false;
+            }
+            return ProcessHandle.allProcesses().anyMatch(handle -> {
+                String command = handle.info().command().orElse("").trim();
+                if (!EggnetCommunitySupport.hasText(command)) {
+                    return false;
+                }
+                Path commandPath = safePath(command);
+                if (commandPath == null) {
+                    return false;
+                }
+                return expected.equals(normalizePathString(commandPath));
+            });
+        }
+
+        private Path safePath(String raw) {
+            try {
+                String value = Objects.requireNonNullElse(raw, "").trim();
+                if (!EggnetCommunitySupport.hasText(value)) {
+                    return null;
+                }
+                return Paths.get(value);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+
+        private String normalizePathString(Path path) {
+            if (path == null) {
+                return "";
+            }
+            try {
+                return path.toAbsolutePath().normalize().toString().toLowerCase(Locale.ROOT);
+            } catch (Exception ignored) {
+                return path.toString().toLowerCase(Locale.ROOT);
+            }
+        }
+
         private void ensureServerRunning() throws Exception {
             synchronized (serverLifecycleLock) {
                 Channel existing = this.server;
@@ -504,31 +963,16 @@ public final class NetherNetConnectorCli {
                 }
 
                 closeServerLocked();
-                killPortHoldersIfNeeded(LISTEN_PORT);
 
                 NetherNetDiscoverySignaling nextDiscovery = new NetherNetDiscoverySignaling();
-                ChannelFuture bindFuture;
-                try {
-                    bindFuture = createServerBootstrap(nextDiscovery)
-                            .bind(new InetSocketAddress("0.0.0.0", LISTEN_PORT))
-                            .sync();
-                } catch (Exception firstBindError) {
-                    warn("Initial bind to %s failed: %s", LISTEN_PORT, firstBindError.getMessage());
-                    killPortHoldersIfNeeded(LISTEN_PORT);
-                    try {
-                        nextDiscovery.close();
-                    } catch (Exception ignored) {
-                    }
-                    nextDiscovery = new NetherNetDiscoverySignaling();
-                    bindFuture = createServerBootstrap(nextDiscovery)
-                            .bind(new InetSocketAddress("0.0.0.0", LISTEN_PORT))
-                            .sync();
-                }
+                ChannelFuture bindFuture = createServerBootstrap(nextDiscovery)
+                        .bind(new InetSocketAddress("0.0.0.0", LOCAL_DISCOVERY_PORT))
+                        .sync();
 
                 this.discoverySignaling = nextDiscovery;
                 this.server = bindFuture.channel();
                 InetSocketAddress bound = (InetSocketAddress) bindFuture.channel().localAddress();
-                info("Connector listening on %s", bound);
+                info("Connector listening on %s; broadcasting LAN advertisements to UDP %s", bound, MINECRAFT_DISCOVERY_PORT);
             }
         }
 
@@ -716,13 +1160,13 @@ public final class NetherNetConnectorCli {
         }
 
         private NetherNetServerSignaling.PongData buildAdvertisement(TargetRoute route) {
-            String serverName = truncate(EggnetCommunitySupport.firstNonBlank(
+            String serverName = lanDisplayName(EggnetCommunitySupport.firstNonBlank(
                     route.hostName(),
                     route.ownerGamertag(),
                     route.displayTitle(),
                     "Server"
             ), 48);
-            String levelName = truncate(EggnetCommunitySupport.firstNonBlank(
+            String levelName = lanDisplayName(EggnetCommunitySupport.firstNonBlank(
                     route.worldName(),
                     route.displayTitle(),
                     "World"
@@ -933,37 +1377,6 @@ public final class NetherNetConnectorCli {
             return "";
         }
 
-        private void killPortHoldersIfNeeded(int port) {
-            if (!isWindows()) {
-                return;
-            }
-            long currentPid = ProcessHandle.current().pid();
-            String command = "$ids=@(); "
-                    + "try { $ids += Get-NetTCPConnection -State Listen -LocalPort " + port + " -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess } catch {} ; "
-                    + "try { $ids += Get-NetUDPEndpoint -LocalPort " + port + " -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess } catch {} ; "
-                    + "$ids = $ids | Where-Object { $_ -and $_ -ne " + currentPid + " } | Select-Object -Unique; "
-                    + "foreach ($id in $ids) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue; Write-Output ('killed=' + $id) }";
-            ProcessBuilder processBuilder = new ProcessBuilder(
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy", "Bypass",
-                    "-Command", command
-            );
-            processBuilder.redirectErrorStream(true);
-            try {
-                Process process = processBuilder.start();
-                String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-                process.waitFor();
-                for (String line : output.split("\\R")) {
-                    String trimmed = line == null ? "" : line.trim();
-                    if (trimmed.startsWith("killed=")) {
-                        info("Killed existing port %s holder pid=%s", port, trimmed.substring("killed=".length()).trim());
-                    }
-                }
-            } catch (Exception e) {
-                warn("port %s cleanup failed: %s", port, e.getMessage());
-            }
-        }
     }
 
     private static final class LocalInboundHandler extends ChannelInboundHandlerAdapter {
@@ -1115,11 +1528,29 @@ public final class NetherNetConnectorCli {
             long authExpiresAtMs
     ) { }
 
+    private record LocalGuestFollows(Set<String> ownerXuids, Set<String> nethernetIds) {
+        static LocalGuestFollows empty() {
+            return new LocalGuestFollows(Set.of(), Set.of());
+        }
+
+        boolean isEmpty() {
+            return ownerXuids.isEmpty() && nethernetIds.isEmpty();
+        }
+
+        boolean matches(String ownerXuid, String nethernetId) {
+            String safeOwner = EggnetCommunitySupport.normalizeXuid(ownerXuid);
+            String safeNether = nethernetId == null ? "" : nethernetId.trim();
+            return (EggnetCommunitySupport.hasText(safeOwner) && ownerXuids.contains(safeOwner))
+                    || (EggnetCommunitySupport.hasText(safeNether) && nethernetIds.contains(safeNether));
+        }
+    }
+
     private static final class Args {
         private String xuidOverride = "";
         private long refreshMs = DEFAULT_REFRESH_MS;
         private long authRefreshMs = DEFAULT_AUTH_REFRESH_MS;
         private boolean desktopManaged = false;
+        private boolean desktopResident = false;
 
         static Args parse(String[] args) {
             Args parsed = new Args();
@@ -1145,6 +1576,7 @@ public final class NetherNetConnectorCli {
                         }
                     }
                     case "--desktop-managed" -> parsed.desktopManaged = true;
+                    case "--desktop-resident" -> parsed.desktopResident = true;
                     default -> {
                     }
                 }
@@ -1346,17 +1778,19 @@ public final class NetherNetConnectorCli {
         }
     }
 
-    private static boolean isWindows() {
-        String osName = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-        return osName.contains("win");
-    }
-
     private static String truncate(String input, int max) {
         String value = input == null ? "" : input.trim();
         if (value.length() <= max) {
             return value;
         }
         return value.substring(0, Math.max(0, max - 3)) + "...";
+    }
+
+    private static String lanDisplayName(String input, int max) {
+        if (max <= 1) {
+            return truncate(input, max);
+        }
+        return truncate(input, max - 1) + " ";
     }
 
     private static void info(String format, Object... args) {

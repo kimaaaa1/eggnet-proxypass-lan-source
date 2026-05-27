@@ -208,6 +208,18 @@ public class NetherNetDiscoverySignaling implements NetherNetClientSignaling, Ne
         }
     }
 
+    public synchronized void sendDiscoveryResponsesTo(List<InetSocketAddress> targets) {
+        if (targets == null || targets.isEmpty()) {
+            return;
+        }
+        for (InetSocketAddress target : targets) {
+            if (target == null) {
+                continue;
+            }
+            this.discovery.sendDiscoveryResponsesTo(target);
+        }
+    }
+
     @Override
     public void sendSignal(String targetNetworkId, String data) {
         String actualIdStr = targetNetworkId;

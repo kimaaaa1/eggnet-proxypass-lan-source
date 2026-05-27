@@ -119,7 +119,7 @@ public class NetherNetDiscovery extends SimpleChannelInboundHandler<DatagramPack
 
     public void setPongData(long localNetworkId, PongData data) {
         ByteBuf buf = Unpooled.buffer();
-        buf.writeByte(4); // Version
+        buf.writeByte(5); // Minecraft 1.21.9x LAN ServerData version
         writeString(buf, data.serverName());
         writeString(buf, data.levelName());
         buf.writeByte(data.gameType() << 1);
@@ -127,15 +127,19 @@ public class NetherNetDiscovery extends SimpleChannelInboundHandler<DatagramPack
         buf.writeIntLE(data.maxPlayerCount());
         buf.writeBoolean(data.isEditorWorld());
         buf.writeBoolean(data.isHardcore());
+        // Minecraft 1.21.9x adds two boolean flags before transport/connection.
+        // Captured vanilla LAN worlds currently send both as true.
+        buf.writeBoolean(true);
+        buf.writeBoolean(true);
         buf.writeByte(data.transportLayer() << 1);
         buf.writeByte(data.connectionType() << 1);
         byte[] binaryData = new byte[buf.readableBytes()];
         buf.readBytes(binaryData);
         buf.release();
-        
+
         String hex = encodeHex(binaryData);
         byte[] hexBytes = hex.getBytes(StandardCharsets.UTF_8);
-        
+
         ByteBuf response = Unpooled.buffer();
         response.writeIntLE(hexBytes.length);
         response.writeBytes(hexBytes);
@@ -400,7 +404,7 @@ public class NetherNetDiscovery extends SimpleChannelInboundHandler<DatagramPack
     }
 
     public void sendDiscoveryResponsesTo(InetSocketAddress sender) {
-        if (this.pongDataByNetworkId.isEmpty()) {
+        if (!isActive() || this.pongDataByNetworkId.isEmpty()) {
             return;
         }
         for (Map.Entry<Long, byte[]> entry : this.pongDataByNetworkId.entrySet()) {

@@ -47,7 +47,7 @@ import org.cloudburstmc.protocol.bedrock.BedrockPeer;
 import org.cloudburstmc.protocol.bedrock.BedrockPong;
 import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.cloudburstmc.protocol.bedrock.codec.BedrockCodecHelper;
-import org.cloudburstmc.protocol.bedrock.codec.v924.Bedrock_v924;
+import org.cloudburstmc.protocol.bedrock.codec.v975.Bedrock_v975;
 import org.cloudburstmc.protocol.bedrock.data.EncodingSettings;
 import org.cloudburstmc.protocol.bedrock.data.definitions.BlockDefinition;
 import org.cloudburstmc.protocol.bedrock.netty.initializer.BedrockChannelInitializer;
@@ -70,9 +70,6 @@ import org.cloudburstmc.proxypass.xbox.XboxSessionManager;
 
 import java.awt.Color;
 import java.awt.Desktop;
-import java.awt.Toolkit;
-import java.awt.datatransfer.Clipboard;
-import java.awt.datatransfer.StringSelection;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -106,11 +103,11 @@ public class ProxyPass {
     public static final YAMLMapper YAML_MAPPER = (YAMLMapper) new YAMLMapper().disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
     public static final String MINECRAFT_VERSION;
 
-    public static final BedrockCodecHelper HELPER = Bedrock_v924.CODEC.createHelper();
-    public static final BedrockCodec CODEC = Bedrock_v924.CODEC
+    public static final BedrockCodecHelper HELPER = Bedrock_v975.CODEC.createHelper();
+    public static final BedrockCodec CODEC = Bedrock_v975.CODEC
         .toBuilder()
-        .protocolVersion(924)
-        .minecraftVersion("1.26.0")
+        .protocolVersion(975)
+        .minecraftVersion("1.26.20")
         .helper(() -> HELPER).build();
         
     public static final int PROTOCOL_VERSION = CODEC.getProtocolVersion();
@@ -132,9 +129,9 @@ public class ProxyPass {
     private static final String COMMUNITY_RANDOM_ACTOR_URL_DEFAULT = "https://eggnet.space/api/xbl/random_actor";
     private static final Duration LIST2_CONNECT_TIMEOUT = EggnetCommunitySupport.CONNECT_TIMEOUT;
     private static final Duration LIST2_REQUEST_TIMEOUT = EggnetCommunitySupport.REQUEST_TIMEOUT;
-    private static final long LIVE_DEST_REFRESH_SECONDS = 1L;
+    private static final long LIVE_DEST_REFRESH_SECONDS = 5L;
     private static final int LIVE_DEST_MAX_ROUTES = 20;
-    private static final long COMMUNITY_REFRESH_MS_DEFAULT = 1_000L;
+    private static final long COMMUNITY_REFRESH_MS_DEFAULT = 5_000L;
     private static final long DESKTOP_XUID_CACHE_MS = 3_000L;
     private static final int COMMUNITY_LIST_LIMIT = EggnetCommunitySupport.COMMUNITY_LIST_LIMIT;
     private static final int COMMUNITY_MAX_PAGES = EggnetCommunitySupport.COMMUNITY_MAX_PAGES;
@@ -1512,16 +1509,18 @@ public class ProxyPass {
         BedrockAuthManager authManager = authManagerBuilder.login(DeviceCodeMsaAuthService::new, new Consumer<MsaDeviceCode>() {
             @Override
             public void accept(MsaDeviceCode msaDeviceCode) {
-                log.info("Go to " + msaDeviceCode.getVerificationUri());
+                URI verificationUri = URI.create(
+                        msaDeviceCode.getVerificationUri()
+                                + (URI.create(msaDeviceCode.getVerificationUri()).getQuery() != null ? '&' : '?') + "otc=" + msaDeviceCode.getUserCode()
+                );
+
+                log.info("Go to " + verificationUri);
                 log.info("Enter code " + msaDeviceCode.getUserCode());
 
                 if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
                     try {
-                        Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
-                        clipboard.setContents(new StringSelection(msaDeviceCode.getUserCode()), null);
-                        log.info("Copied code to clipboard");
-                        Desktop.getDesktop().browse(new URI(msaDeviceCode.getVerificationUri()));
-                    } catch (IOException | URISyntaxException e) {
+                        Desktop.getDesktop().browse(verificationUri);
+                    } catch (IOException e) {
                         log.error("Failed to open browser", e);
                     }
                 }

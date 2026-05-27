@@ -250,20 +250,24 @@ public class EncryptionUtils {
             if (token == null || token.isEmpty()) {
                 throw new IllegalStateException("Token is empty");
             }
-            return validateDual(chain, token);
+            return validateDual(payload.getAuthType(), chain, token);
         } else {
             throw new IllegalArgumentException("Unsupported AuthPayload type: " + payload.getClass().getName());
         }
     }
 
-    public static ChainValidationResult validateDual(List<String> chain, String token)
+    public static ChainValidationResult validateDual(AuthType authType, List<String> chain, String token)
             throws JoseException, NoSuchAlgorithmException, InvalidKeySpecException, InvalidJwtException {
-        ChainValidationResult chainResult = validateChain(chain);
-        ChainValidationResult tokenResult = validateToken(AuthType.FULL, token);
-        if (!chainResult.signed() || !tokenResult.signed()) {
-            throw new IllegalStateException("Invalid chain or token in DualPayload");
+        ChainValidationResult chainResult;
+        if (chain.size() > 0 && "..".equals(chain.get(0))) {
+            // no longer include in v944 and above
+            chainResult = null;
+        } else {
+            chainResult = validateChain(chain);
         }
-        return new ChainValidationResult(true, tokenResult.getJwtContext(), chainResult.getParsedPayload());
+        ChainValidationResult tokenResult = validateToken(authType, token);
+
+        return new ChainValidationResult(true, tokenResult.getJwtContext(), chainResult != null ? chainResult.getParsedPayload() : null);
     }
 
     public static ChainValidationResult validateChain(List<String> chain)
