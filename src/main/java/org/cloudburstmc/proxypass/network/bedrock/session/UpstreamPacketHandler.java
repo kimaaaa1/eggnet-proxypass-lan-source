@@ -189,7 +189,7 @@ public class UpstreamPacketHandler implements BedrockPacketHandler {
             return;
         }
 
-        this.proxy.newClient(destination, downstream -> {
+        this.proxy.newClient(destination, this.incomingXuid, downstream -> {
             BedrockCodec.Builder codecBuilder = ProxyPass.CODEC.toBuilder();
             downstream.setCodec(codecBuilder.build());
 

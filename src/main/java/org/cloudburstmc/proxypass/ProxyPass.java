@@ -127,6 +127,7 @@ public class ProxyPass {
     private static final String COMMUNITY_FOLLOWERS_URL_DEFAULT = EggnetCommunitySupport.COMMUNITY_FOLLOWERS_URL_DEFAULT;
     private static final String COMMUNITY_FOLLOWING_URL_DEFAULT = EggnetCommunitySupport.COMMUNITY_FOLLOWING_URL_DEFAULT;
     private static final String COMMUNITY_RANDOM_ACTOR_URL_DEFAULT = "https://eggnet.space/api/xbl/random_actor";
+    private static final String JOIN_SIMPLE_URL_DEFAULT = "https://eggnet.space/api/join/simple";
     private static final Duration LIST2_CONNECT_TIMEOUT = EggnetCommunitySupport.CONNECT_TIMEOUT;
     private static final Duration LIST2_REQUEST_TIMEOUT = EggnetCommunitySupport.REQUEST_TIMEOUT;
     private static final long LIVE_DEST_REFRESH_SECONDS = 5L;
@@ -240,6 +241,7 @@ public class ProxyPass {
         private final long localNetworkId;
         private final String localNetworkIdText;
         private final NetherNetServerSignaling.PongData advertisementData;
+        private final String targetServerId;
         private final String targetNethernetId;
         private final String targetPmsgId;
         private final String targetSessionScid;
@@ -253,6 +255,7 @@ public class ProxyPass {
                 long localNetworkId,
                 String localNetworkIdText,
                 NetherNetServerSignaling.PongData advertisementData,
+                String targetServerId,
                 String targetNethernetId,
                 String targetPmsgId,
                 String targetSessionScid,
@@ -264,6 +267,7 @@ public class ProxyPass {
             this.localNetworkId = localNetworkId;
             this.localNetworkIdText = localNetworkIdText;
             this.advertisementData = advertisementData;
+            this.targetServerId = targetServerId;
             this.targetNethernetId = targetNethernetId;
             this.targetPmsgId = targetPmsgId;
             this.targetSessionScid = targetSessionScid;
@@ -273,6 +277,7 @@ public class ProxyPass {
     }
 
     private static final class LiveServerInfo {
+        private final String serverId;
         private final String nethernetId;
         private final String pmsgId;
         private final String sessionScid;
@@ -290,6 +295,7 @@ public class ProxyPass {
         private final int transportLayer;
 
         private LiveServerInfo(
+                String serverId,
                 String nethernetId,
                 String pmsgId,
                 String sessionScid,
@@ -305,6 +311,7 @@ public class ProxyPass {
                 int maxMemberCount,
                 int connectionType,
                 int transportLayer) {
+            this.serverId = serverId;
             this.nethernetId = nethernetId;
             this.pmsgId = pmsgId;
             this.sessionScid = sessionScid;
@@ -562,15 +569,67 @@ public class ProxyPass {
     }
 
     public void newClient(ResolvedDestination destination, Consumer<ProxyClientSession> sessionConsumer) {
+        this.newClient(destination, "", sessionConsumer);
+    }
+
+    public void newClient(ResolvedDestination destination, String joinerXuid, Consumer<ProxyClientSession> sessionConsumer) {
         if (destination == null) {
             throw new IllegalArgumentException("Resolved destination is required");
         }
         this.targetAddress = destination.getTargetAddress();
         this.serverAddress = destination.getServerAddress();
 
+        this.primeJoinSimple(destination, joinerXuid);
+
         String transport = destination.getDestination() != null ? destination.getDestination().getTransport() : null;
         String networkProtocol = destination.getServerAddress().getNetworkProtocol();
         this.newClient(destination.getTargetAddress(), transport, networkProtocol, sessionConsumer);
+    }
+
+    private void primeJoinSimple(ResolvedDestination destination, String joinerXuid) {
+        if (destination == null) {
+            return;
+        }
+        String serverId = destination.getTargetServerId();
+        String nethernetId = destination.getTargetNethernetId();
+        String safeJoinerXuid = joinerXuid == null ? "" : joinerXuid.trim();
+        if (!hasText(serverId) || !hasText(nethernetId) || !hasText(safeJoinerXuid)) {
+            return;
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("serverId", serverId);
+        payload.put("nethernetId", nethernetId);
+        payload.put("joinerXuid", safeJoinerXuid);
+        if (hasText(destination.getTargetPmsgId())) {
+            payload.put("worldPmsgId", destination.getTargetPmsgId());
+        }
+
+        try {
+            String body = ProxyPass.JSON_MAPPER.writeValueAsString(payload);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(JOIN_SIMPLE_URL_DEFAULT))
+                    .timeout(Duration.ofSeconds(6))
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "ProxyPassJoinSimplePrime/1.0")
+                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                    .build();
+            HttpResponse<String> response = this.list2HttpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
+            );
+            if (response.statusCode() >= 200 && response.statusCode() < 300) {
+                log.info("joinSimple primed before downstream join serverId={} joinerXuid={} nethernetId={}",
+                        serverId, safeJoinerXuid, nethernetId);
+            } else {
+                log.warn("joinSimple prime returned status={} serverId={} joinerXuid={} nethernetId={}",
+                        response.statusCode(), serverId, safeJoinerXuid, nethernetId);
+            }
+        } catch (Exception e) {
+            log.warn("joinSimple prime failed serverId={} joinerXuid={} nethernetId={} err={}",
+                    serverId, safeJoinerXuid, nethernetId, e.getMessage());
+        }
     }
 
     private void newClient(
@@ -798,6 +857,7 @@ public class ProxyPass {
                     localNetworkId,
                     localNetworkIdText,
                     advertisement,
+                    "",
                     destination.getNethernetId(),
                     destination.getPmsgId(),
                     "",
@@ -987,6 +1047,7 @@ public class ProxyPass {
                     localNetworkId,
                     localNetworkIdText,
                     advertisement,
+                    live.serverId,
                     live.nethernetId,
                     live.pmsgId,
                     live.sessionScid,
@@ -1108,11 +1169,18 @@ public class ProxyPass {
                     );
             this.liveServerSnapshot = snapshot;
             Map<String, EggnetCommunitySupport.LiveServerInfo> fetched = snapshot.serversByNetherId();
+            Map<String, String> serverIdsByNetherId = new HashMap<>();
+            for (Map.Entry<String, String> entry : snapshot.netherIdByServerId().entrySet()) {
+                if (hasText(entry.getValue())) {
+                    serverIdsByNetherId.put(entry.getValue(), entry.getKey());
+                }
+            }
             Map<String, LiveServerInfo> byNether = new HashMap<>(fetched.size());
             for (EggnetCommunitySupport.LiveServerInfo live : fetched.values()) {
                 byNether.put(
                         live.nethernetId(),
                         new LiveServerInfo(
+                                serverIdsByNetherId.getOrDefault(live.nethernetId(), ""),
                                 live.nethernetId(),
                                 live.pmsgId(),
                                 live.sessionScid(),
